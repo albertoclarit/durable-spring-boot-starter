@@ -111,121 +111,29 @@ Your business process
 
 ## Examples
 
-### Start a process (safe to call more than once)
+Each listing is a **complete Java class**: `package`, `import`s, `public class …`, fields, constructors, and methods. Put each class in its own file with the same name.
 
-```java
-WorkflowHandle<SettlementResult> workflow =
-    durable.start(
-        "settlement-" + settlementId,
-        new SettlementJob(settlementId)
-    );
-```
+Spring collaborators on a job must be `transient` (or `@JsonIgnore`). They are not part of the workflow identity; they are injected again every time the job runs, including after a crash. Include a no-arg constructor so the engine can deserialize the job.
 
-Calling this again with `"settlement-123"` returns the **same** process. If it already failed, it stays failed; the library will not quietly start a second one.
+Gradle:
 
-### Write the process as a Java method
-
-```java
-public SettlementResult run(Context ctx) {
-
-    var settlement =
-        ctx.step("load-settlement", () -> settlementService.load(settlementId));
-
-    var calculation =
-        ctx.step("calculate", () -> settlementService.calculate(settlement));
-
-    if (calculation.isNegative()) {
-        ctx.sleep(Duration.ofHours(24));
-        calculation =
-            ctx.step("recalculate", () -> settlementService.recalculate(settlement));
-    }
-
-    var payout =
-        ctx.activity(
-            "payout",
-            ActivityOptions.idempotencyKey("payout:" + settlementId),
-            () -> payoutService.execute(calculation)
-        );
-
-    var confirmation = ctx.await("bank-confirmation");
-
-    ctx.step("reconcile", () -> reconcile(payout, confirmation));
-
-    return new SettlementResult(calculation, payout);
+```gradle
+dependencies {
+    implementation 'io.github.albertoclarit:durable-spring-boot-starter:0.1.0'
 }
 ```
 
-Someone else in the system can later tell the workflow the bank replied:
-
-```java
-durable.signal("settlement-123", "bank-confirmation", confirmation);
-```
-
-### Pass results from one step to the next
-
-You do not manage a “state bag.” You use Java variables:
-
-```java
-var customer = ctx.step("load-customer", () -> customerService.load(customerId));
-var account = ctx.activity("create-account", () -> accountService.create(customer));
-var accountType = ctx.step("determine-account-type", () -> determineType(account));
-```
-
-### Crash in the middle
-
-If **load** and **calculate** finished, and the machine died before **payout**:
-
-- On resume, load and calculate **return saved results** (those methods do not run again).
-- Payout **runs**.
-
-### Only retry when you ask
-
-```java
-ctx.activity(
-    "send-payout",
-    RetryPolicy.exponentialBackoff(5, Duration.ofSeconds(10)),
-    () -> bank.send()
-);
-```
-
-With no retry policy, one exception **fails the whole process**. That is intentional: money movement should not retry unless you said so.
-
-### Loops: name each item (never random ids)
-
-```java
-for (SettlementItem item : items) {
-    ctx.step("settlement-item/" + item.id(), () -> calculate(item));
-}
-```
-
-### Nested process
-
-```java
-var payout = ctx.startChild("payout", new PayoutJob(validation));
-return payout.result();
-```
-
-### Tiny runnable demo
-
-The `durable-example` module starts a `HelloJob`: a step that builds a greeting, then an activity that “announces” it. Run it with `durable.store=memory` for a local try-out.
-
----
-
-## Quick start (for developers)
-
-1. Depend on `io.github.albertoclarit:durable-spring-boot-starter`.
-2. Enable the starter (auto-config is on the classpath; `@EnableDurableWorkflow` is explicit).
-3. Inject `Durable` and call `start(workflowId, job)`.
-4. Implement `DurableJob<T>` with `run(Context ctx)`.
-
-For local / tests:
+Local config (`application.yml`) — progress is lost if the process dies:
 
 ```yaml
 durable:
   store: memory
+spring:
+  application:
+    name: settlement-app
 ```
 
-For production (progress must survive process death), use PostgreSQL:
+Production — progress lives in PostgreSQL:
 
 ```yaml
 durable:
@@ -236,7 +144,592 @@ durable:
     password: secret
 ```
 
-Mark Spring services on the job as `transient` (or `@JsonIgnore`) so they are not treated as part of the job’s identity. They are re-injected each time the job runs.
+### `SettlementJob.java` — the workflow class
+
+This is the class you implement. It must declare `implements DurableJob<SettlementResult>`.
+
+```java
+package com.example.settlement;
+
+import io.github.albertoclarit.durable.ActivityOptions;
+import io.github.albertoclarit.durable.Context;
+import io.github.albertoclarit.durable.DurableJob;
+import org.springframework.beans.factory.annotation.Autowired;
+
+import java.time.Duration;
+
+public class SettlementJob implements DurableJob<SettlementResult> {
+
+    private final long settlementId;
+
+    @Autowired
+    private transient SettlementService settlementService;
+
+    @Autowired
+    private transient PayoutService payoutService;
+
+    public SettlementJob() {
+        this(0L);
+    }
+
+    public SettlementJob(long settlementId) {
+        this.settlementId = settlementId;
+    }
+
+    @Override
+    public SettlementResult run(Context ctx) {
+        Settlement settlement = ctx.step(
+                "load-settlement",
+                () -> settlementService.load(settlementId)
+        );
+
+        Calculation calculation = ctx.step(
+                "calculate",
+                () -> settlementService.calculate(settlement)
+        );
+
+        if (calculation.isNegative()) {
+            ctx.sleep(Duration.ofHours(24));
+            calculation = ctx.step(
+                    "recalculate",
+                    () -> settlementService.recalculate(settlement)
+            );
+        }
+
+        PayoutReceipt payout = ctx.activity(
+                "payout",
+                ActivityOptions.idempotencyKey("payout:" + settlementId),
+                () -> payoutService.execute(calculation)
+        );
+
+        BankConfirmation confirmation = ctx.await(
+                "bank-confirmation",
+                BankConfirmation.class
+        );
+
+        ctx.step(
+                "reconcile",
+                () -> settlementService.reconcile(payout, confirmation)
+        );
+
+        return new SettlementResult(calculation, payout);
+    }
+}
+```
+
+If **load** and **calculate** finished and the machine died before **payout**: on resume those two steps return saved results (the lambdas do not run again); **payout** runs. Values move between operations as ordinary Java locals — there is no extra state bag.
+
+### `SettlementApplication.java`
+
+```java
+package com.example.settlement;
+
+import io.github.albertoclarit.durable.annotation.EnableDurableWorkflow;
+import org.springframework.boot.SpringApplication;
+import org.springframework.boot.autoconfigure.SpringBootApplication;
+
+@SpringBootApplication
+@EnableDurableWorkflow
+public class SettlementApplication {
+
+    public static void main(String[] args) {
+        SpringApplication.run(SettlementApplication.class, args);
+    }
+}
+```
+
+### `Settlement.java`
+
+```java
+package com.example.settlement;
+
+import java.math.BigDecimal;
+
+public class Settlement {
+
+    private final long id;
+    private final BigDecimal grossAmount;
+
+    public Settlement() {
+        this(0L, BigDecimal.ZERO);
+    }
+
+    public Settlement(long id, BigDecimal grossAmount) {
+        this.id = id;
+        this.grossAmount = grossAmount;
+    }
+
+    public long id() {
+        return id;
+    }
+
+    public BigDecimal grossAmount() {
+        return grossAmount;
+    }
+}
+```
+
+### `Calculation.java`
+
+```java
+package com.example.settlement;
+
+import java.math.BigDecimal;
+
+public class Calculation {
+
+    private final BigDecimal netAmount;
+
+    public Calculation() {
+        this(BigDecimal.ZERO);
+    }
+
+    public Calculation(BigDecimal netAmount) {
+        this.netAmount = netAmount;
+    }
+
+    public BigDecimal netAmount() {
+        return netAmount;
+    }
+
+    public boolean isNegative() {
+        return netAmount.signum() < 0;
+    }
+}
+```
+
+### `PayoutReceipt.java`
+
+```java
+package com.example.settlement;
+
+public class PayoutReceipt {
+
+    private final String bankReference;
+
+    public PayoutReceipt() {
+        this("");
+    }
+
+    public PayoutReceipt(String bankReference) {
+        this.bankReference = bankReference;
+    }
+
+    public String bankReference() {
+        return bankReference;
+    }
+}
+```
+
+### `BankConfirmation.java`
+
+```java
+package com.example.settlement;
+
+public class BankConfirmation {
+
+    private final String status;
+
+    public BankConfirmation() {
+        this("");
+    }
+
+    public BankConfirmation(String status) {
+        this.status = status;
+    }
+
+    public String status() {
+        return status;
+    }
+}
+```
+
+### `SettlementResult.java`
+
+```java
+package com.example.settlement;
+
+public class SettlementResult {
+
+    private final Calculation calculation;
+    private final PayoutReceipt payout;
+
+    public SettlementResult() {
+        this(new Calculation(), new PayoutReceipt());
+    }
+
+    public SettlementResult(Calculation calculation, PayoutReceipt payout) {
+        this.calculation = calculation;
+        this.payout = payout;
+    }
+
+    public Calculation calculation() {
+        return calculation;
+    }
+
+    public PayoutReceipt payout() {
+        return payout;
+    }
+}
+```
+
+### `SettlementItem.java`
+
+```java
+package com.example.settlement;
+
+import java.math.BigDecimal;
+
+public class SettlementItem {
+
+    private final long id;
+    private final BigDecimal amount;
+
+    public SettlementItem() {
+        this(0L, BigDecimal.ZERO);
+    }
+
+    public SettlementItem(long id, BigDecimal amount) {
+        this.id = id;
+        this.amount = amount;
+    }
+
+    public long id() {
+        return id;
+    }
+
+    public BigDecimal amount() {
+        return amount;
+    }
+}
+```
+
+### `SettlementService.java`
+
+```java
+package com.example.settlement;
+
+import org.springframework.stereotype.Service;
+
+import java.math.BigDecimal;
+import java.util.List;
+
+@Service
+public class SettlementService {
+
+    public Settlement load(long settlementId) {
+        return new Settlement(settlementId, new BigDecimal("100.00"));
+    }
+
+    public Calculation calculate(Settlement settlement) {
+        return new Calculation(settlement.grossAmount());
+    }
+
+    public Calculation recalculate(Settlement settlement) {
+        return new Calculation(settlement.grossAmount().abs());
+    }
+
+    public List<SettlementItem> items(Settlement settlement) {
+        return List.of(
+                new SettlementItem(1, new BigDecimal("40.00")),
+                new SettlementItem(2, new BigDecimal("60.00"))
+        );
+    }
+
+    public BigDecimal lineAmount(SettlementItem item) {
+        return item.amount();
+    }
+
+    public SettlementResult reconcile(PayoutReceipt payout, BankConfirmation confirmation) {
+        return new SettlementResult(new Calculation(BigDecimal.ZERO), payout);
+    }
+}
+```
+
+### `PayoutService.java`
+
+```java
+package com.example.settlement;
+
+import org.springframework.stereotype.Service;
+
+@Service
+public class PayoutService {
+
+    public PayoutReceipt execute(Calculation calculation) {
+        return new PayoutReceipt("bank-ref-" + calculation.netAmount());
+    }
+
+    public PayoutReceipt send(SettlementItem item, String idempotencyKey) {
+        return new PayoutReceipt("item-" + item.id() + "-" + idempotencyKey);
+    }
+}
+```
+
+### `SettlementController.java` — start (safe to call more than once)
+
+```java
+package com.example.settlement;
+
+import io.github.albertoclarit.durable.Durable;
+import io.github.albertoclarit.durable.WorkflowHandle;
+import org.springframework.web.bind.annotation.PathVariable;
+import org.springframework.web.bind.annotation.PostMapping;
+import org.springframework.web.bind.annotation.RestController;
+
+@RestController
+public class SettlementController {
+
+    private final Durable durable;
+
+    public SettlementController(Durable durable) {
+        this.durable = durable;
+    }
+
+    @PostMapping("/settlements/{id}/start")
+    public String start(@PathVariable long id) {
+        WorkflowHandle<SettlementResult> workflow = durable.start(
+                "settlement-" + id,
+                new SettlementJob(id)
+        );
+        return workflow.id();
+    }
+}
+```
+
+`POST /settlements/123/start` three times still creates **one** process named `settlement-123`. If it already failed, it stays failed; the library will not quietly start a second one.
+
+`start` does not wait for the job to finish. Use `workflow.result()` (or `result(Duration)`) if the HTTP caller must block until completion.
+
+### `BankWebhookController.java` — signal a waiting workflow
+
+```java
+package com.example.settlement;
+
+import io.github.albertoclarit.durable.Durable;
+import org.springframework.web.bind.annotation.PathVariable;
+import org.springframework.web.bind.annotation.PostMapping;
+import org.springframework.web.bind.annotation.RequestBody;
+import org.springframework.web.bind.annotation.RestController;
+
+@RestController
+public class BankWebhookController {
+
+    private final Durable durable;
+
+    public BankWebhookController(Durable durable) {
+        this.durable = durable;
+    }
+
+    @PostMapping("/settlements/{id}/bank-confirmation")
+    public void confirmed(
+            @PathVariable long id,
+            @RequestBody BankConfirmation confirmation
+    ) {
+        durable.signal("settlement-" + id, "bank-confirmation", confirmation);
+    }
+}
+```
+
+If the webhook arrives **before** the job reaches `await`, the signal is stored and applied when `await` runs. Signaling an unknown workflow id fails.
+
+### `ItemPayoutJob.java` — activity inside a loop
+
+Give every iteration a **stable** name from a business id. Never `UUID.randomUUID()`. Reusing `"payout"` for every item fails (duplicate name).
+
+```java
+package com.example.settlement;
+
+import io.github.albertoclarit.durable.ActivityContext;
+import io.github.albertoclarit.durable.ActivityOptions;
+import io.github.albertoclarit.durable.Context;
+import io.github.albertoclarit.durable.DurableJob;
+import org.springframework.beans.factory.annotation.Autowired;
+
+import java.math.BigDecimal;
+import java.util.ArrayList;
+import java.util.List;
+
+public class ItemPayoutJob implements DurableJob<List<PayoutReceipt>> {
+
+    private final long settlementId;
+
+    @Autowired
+    private transient SettlementService settlementService;
+
+    @Autowired
+    private transient PayoutService payoutService;
+
+    public ItemPayoutJob() {
+        this(0L);
+    }
+
+    public ItemPayoutJob(long settlementId) {
+        this.settlementId = settlementId;
+    }
+
+    @Override
+    public List<PayoutReceipt> run(Context ctx) {
+        Settlement settlement = ctx.step(
+                "load",
+                () -> settlementService.load(settlementId)
+        );
+        List<SettlementItem> items = ctx.step(
+                "load-items",
+                () -> settlementService.items(settlement)
+        );
+
+        List<PayoutReceipt> receipts = new ArrayList<>();
+        for (SettlementItem item : items) {
+            BigDecimal amount = ctx.step(
+                    "line/" + item.id(),
+                    () -> settlementService.lineAmount(item)
+            );
+            PayoutReceipt receipt = ctx.activity(
+                    "payout/" + item.id(),
+                    ActivityOptions.idempotencyKey(
+                            "payout:" + settlementId + ":" + item.id()
+                    ),
+                    (ActivityContext act) -> payoutService.send(item, act.idempotencyKey())
+            );
+            receipts.add(receipt);
+            if (amount.signum() < 0) {
+                throw new IllegalStateException("negative line " + item.id());
+            }
+        }
+        return receipts;
+    }
+}
+```
+
+### `RetryingPayoutJob.java` — retry only when you ask
+
+Without a policy, one exception **fails the whole process**. That is intentional for money movement. The retry policy is saved; if the worker dies while waiting for the next attempt, recovery continues that policy.
+
+```java
+package com.example.settlement;
+
+import io.github.albertoclarit.durable.Context;
+import io.github.albertoclarit.durable.DurableJob;
+import io.github.albertoclarit.durable.RetryPolicy;
+import org.springframework.beans.factory.annotation.Autowired;
+
+import java.time.Duration;
+
+public class RetryingPayoutJob implements DurableJob<PayoutReceipt> {
+
+    private final long settlementId;
+
+    @Autowired
+    private transient SettlementService settlementService;
+
+    @Autowired
+    private transient PayoutService payoutService;
+
+    public RetryingPayoutJob() {
+        this(0L);
+    }
+
+    public RetryingPayoutJob(long settlementId) {
+        this.settlementId = settlementId;
+    }
+
+    @Override
+    public PayoutReceipt run(Context ctx) {
+        Calculation calculation = ctx.step(
+                "calculate",
+                () -> settlementService.calculate(settlementService.load(settlementId))
+        );
+        return ctx.activity(
+                "send-payout",
+                RetryPolicy.exponentialBackoff(5, Duration.ofSeconds(10)),
+                () -> payoutService.execute(calculation)
+        );
+    }
+}
+```
+
+### `ParentSettlementJob.java` and `PayoutChildJob.java` — nested workflow
+
+The child id is `parentId + "/" + name` (for example `settlement-123/payout`). Starting that child twice is get-or-create. `result()` waits durably; the parent may suspend until the child finishes.
+
+```java
+package com.example.settlement;
+
+import io.github.albertoclarit.durable.ChildWorkflow;
+import io.github.albertoclarit.durable.Context;
+import io.github.albertoclarit.durable.DurableJob;
+import org.springframework.beans.factory.annotation.Autowired;
+
+public class ParentSettlementJob implements DurableJob<PayoutReceipt> {
+
+    private final long settlementId;
+
+    @Autowired
+    private transient SettlementService settlementService;
+
+    public ParentSettlementJob() {
+        this(0L);
+    }
+
+    public ParentSettlementJob(long settlementId) {
+        this.settlementId = settlementId;
+    }
+
+    @Override
+    public PayoutReceipt run(Context ctx) {
+        Calculation validation = ctx.step(
+                "validate",
+                () -> settlementService.calculate(settlementService.load(settlementId))
+        );
+        ChildWorkflow<PayoutReceipt> payout = ctx.startChild(
+                "payout",
+                new PayoutChildJob(settlementId, validation)
+        );
+        return payout.result();
+    }
+}
+```
+
+```java
+package com.example.settlement;
+
+import io.github.albertoclarit.durable.ActivityOptions;
+import io.github.albertoclarit.durable.Context;
+import io.github.albertoclarit.durable.DurableJob;
+import org.springframework.beans.factory.annotation.Autowired;
+
+public class PayoutChildJob implements DurableJob<PayoutReceipt> {
+
+    private final long settlementId;
+    private final Calculation calculation;
+
+    @Autowired
+    private transient PayoutService payoutService;
+
+    public PayoutChildJob() {
+        this(0L, new Calculation());
+    }
+
+    public PayoutChildJob(long settlementId, Calculation calculation) {
+        this.settlementId = settlementId;
+        this.calculation = calculation;
+    }
+
+    @Override
+    public PayoutReceipt run(Context ctx) {
+        return ctx.activity(
+                "execute",
+                ActivityOptions.idempotencyKey("payout:" + settlementId),
+                () -> payoutService.execute(calculation)
+        );
+    }
+}
+```
+
+### Demo in this repository
+
+The `durable-example` module is a complete Spring Boot app with full class files: `DurableExampleApplication`, `HelloJob`, and `HelloRunner`. It uses `durable.store=memory`. Run `:durable-example` to print `HELLO DURABLE`.
 
 ---
 
