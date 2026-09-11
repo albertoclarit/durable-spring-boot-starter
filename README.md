@@ -83,7 +83,16 @@ Load customer → create account (external) → decide account type (calculation
 
 A parent settlement starts a child payout job. Each has its own id and history. Starting the child twice with the same name does not create two payouts.
 
-### 6. What this is *not*
+### 6. Statement of Account (SOA) report generation
+
+A period-end SOA run must **generate the statement**, **notify metrics**, **email** counterparties, and **upload the file over SFTP**. That is several side effects in a fixed order. If the process dies after email but before SFTP, resume must **not** generate the SOA again, **not** bump metrics again, **not** send a second email, and **must** still upload.
+
+- One business id (`soa-2026-09-11` or `soa-` + partner + date) so a cron or UI cannot start two copies of the same report.
+- **Generate SOA** is usually a `step` if you only build the document in memory (rows → PDF/CSV bytes). Use an `activity` if generation already writes to disk, object storage, or a report table.
+- **Notify metrics**, **send email**, and **upload SFTP** are `activity` calls (externally visible). Give email and SFTP idempotency keys the downstream system can honor.
+- Order in `run` is the order of work: generate → metrics → email → SFTP. A crash in the middle continues from the first unfinished activity.
+
+### 7. What this is *not*
 
 | Need | Prefer |
 |------|--------|
@@ -728,6 +737,142 @@ public class PayoutChildJob implements DurableJob<PayoutReceipt> {
     }
 }
 ```
+
+### `SoaReportJob.java` — generate SOA, metrics, email, SFTP
+
+Start with a stable id such as `"soa-" + partnerId + "-" + reportDate`. A nightly cron should call `durable.start` with that id, not reimplement the four steps as four unrelated queue jobs.
+
+```java
+package com.example.settlement;
+
+import io.github.albertoclarit.durable.ActivityOptions;
+import io.github.albertoclarit.durable.Context;
+import io.github.albertoclarit.durable.DurableJob;
+import org.springframework.beans.factory.annotation.Autowired;
+
+public class SoaReportJob implements DurableJob<SoaReportResult> {
+
+    private final String partnerId;
+    private final String reportDate;
+
+    @Autowired
+    private transient SoaGenerator soaGenerator;
+
+    @Autowired
+    private transient MetricsNotifier metricsNotifier;
+
+    @Autowired
+    private transient EmailSender emailSender;
+
+    @Autowired
+    private transient SftpUploader sftpUploader;
+
+    public SoaReportJob() {
+        this("", "");
+    }
+
+    public SoaReportJob(String partnerId, String reportDate) {
+        this.partnerId = partnerId;
+        this.reportDate = reportDate;
+    }
+
+    @Override
+    public SoaReportResult run(Context ctx) {
+        String reportKey = partnerId + "-" + reportDate;
+
+        SoaDocument document = ctx.step(
+                "generate-soa",
+                () -> soaGenerator.generate(partnerId, reportDate)
+        );
+
+        ctx.activity(
+                "notify-metrics",
+                ActivityOptions.idempotencyKey("metrics:soa:" + reportKey),
+                () -> {
+                    metricsNotifier.recordSoaGenerated(partnerId, reportDate, document.sizeBytes());
+                    return null;
+                }
+        );
+
+        ctx.activity(
+                "send-email",
+                ActivityOptions.idempotencyKey("email:soa:" + reportKey),
+                () -> {
+                    emailSender.sendSoa(partnerId, document);
+                    return null;
+                }
+        );
+
+        ctx.activity(
+                "upload-sftp",
+                ActivityOptions.idempotencyKey("sftp:soa:" + reportKey),
+                () -> sftpUploader.upload(document)
+        );
+
+        return new SoaReportResult(reportKey, document.fileName());
+    }
+}
+```
+
+```java
+package com.example.settlement;
+
+public class SoaDocument {
+
+    private final String fileName;
+    private final byte[] content;
+
+    public SoaDocument() {
+        this("", new byte[0]);
+    }
+
+    public SoaDocument(String fileName, byte[] content) {
+        this.fileName = fileName;
+        this.content = content;
+    }
+
+    public String fileName() {
+        return fileName;
+    }
+
+    public byte[] content() {
+        return content;
+    }
+
+    public int sizeBytes() {
+        return content.length;
+    }
+}
+```
+
+```java
+package com.example.settlement;
+
+public class SoaReportResult {
+
+    private final String reportKey;
+    private final String fileName;
+
+    public SoaReportResult() {
+        this("", "");
+    }
+
+    public SoaReportResult(String reportKey, String fileName) {
+        this.reportKey = reportKey;
+        this.fileName = fileName;
+    }
+
+    public String reportKey() {
+        return reportKey;
+    }
+
+    public String fileName() {
+        return fileName;
+    }
+}
+```
+
+If the worker dies after **send-email** and before **upload-sftp**, replay returns the saved SOA document, skips metrics and email, and runs SFTP only.
 
 ### Demo in this repository
 
