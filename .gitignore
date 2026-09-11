@@ -1,0 +1,8 @@
+.gradle
+**/build/
+local-only/
+.idea/
+*.iml
+out/
+bin/
+.DS_Store

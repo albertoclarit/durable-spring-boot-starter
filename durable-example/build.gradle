@@ -1,0 +1,19 @@
+plugins {
+    alias(libs.plugins.spring.boot)
+}
+
+dependencies {
+    implementation platform(libs.spring.boot.bom)
+    implementation project(':durable-spring-boot-starter')
+    implementation libs.spring.boot.starter
+
+    testImplementation libs.spring.boot.starter.test
+}
+
+bootJar {
+    enabled = true
+}
+
+jar {
+    enabled = false
+}

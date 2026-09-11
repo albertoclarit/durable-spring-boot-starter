@@ -1,0 +1,5 @@
+durable:
+  store: memory
+spring:
+  application:
+    name: durable-example

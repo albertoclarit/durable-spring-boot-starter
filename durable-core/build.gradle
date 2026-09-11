@@ -1,0 +1,17 @@
+dependencies {
+    api platform(libs.spring.boot.bom)
+    api libs.slf4j.api
+    api libs.jackson.databind
+    api libs.jackson.datatype.jsr310
+
+    implementation libs.hikaricp
+    implementation libs.postgresql
+    implementation libs.flyway.core
+    implementation libs.flyway.database.postgresql
+    implementation libs.spring.jdbc
+    implementation libs.spring.tx
+
+    testImplementation platform(libs.spring.boot.bom)
+    testImplementation libs.spring.boot.starter.test
+    testRuntimeOnly 'org.junit.platform:junit-platform-launcher'
+}
