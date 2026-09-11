@@ -219,6 +219,8 @@ public class SettlementJob implements DurableJob<SettlementResult> {
 
 If **load** and **calculate** finished and the machine died before **payout**: on resume those two steps return saved results (the lambdas do not run again); **payout** runs. Values move between operations as ordinary Java locals — there is no extra state bag.
 
+**How `sleep` (and `await`) work in Java:** `run` is **not** lazily evaluated and the JVM does **not** freeze the stack at `sleep`. The method is ordinary eager Java. The first time `ctx.sleep(...)` runs, the engine saves the wake time and **stops that call to `run()`** (internal suspend). The following lines — including `"recalculate"` — are **not** executed in that invocation. After 24 hours a worker **calls `run()` again from the top**. Completed steps return saved values; `sleep` now returns; **then** `"recalculate"` runs. Same idea for `await`: this attempt ends at the wait; the next attempt continues after it.
+
 ### `SettlementApplication.java`
 
 ```java

@@ -133,6 +133,16 @@ Duplicate names in one `run` fail. Unnamed `sleep(Duration)` uses call order (`$
 
 `ctx.sleep` is not `Thread.sleep`. The timer is persisted; the worker is released.
 
+`run` is **eager Java**, not a lazily evaluated declaration. The engine does **not** serialize a paused stack. The first time execution hits `ctx.sleep(...)`, this **invocation of `run()` ends** (internal suspend). Statements after `sleep` in the source are **not** run in that call. Later, a worker **invokes `run()` from the top again**. Finished steps return persisted results; `sleep` returns; **then** the next statement runs.
+
+```java
+ctx.sleep(Duration.ofHours(24));
+// This line does not run until a later run() after the timer fires:
+calculation = ctx.step("recalculate", () -> settlementService.recalculate(settlement));
+```
+
+`await` is the same: this attempt stops at the wait; a later `run()` continues after it.
+
 ```java
 var confirmation = ctx.await("bank-confirmation");
 durable.signal(workflowId, "bank-confirmation", confirmation);
